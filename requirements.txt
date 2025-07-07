@@ -1,0 +1,11 @@
+streamlit==1.28.1
+torch==2.1.0
+torchaudio==2.1.0
+openai-whisper==20231117
+sounddevice==0.4.6
+soundfile==0.12.1
+numpy==1.24.3
+tempfile
+threading
+queue
+datetime
