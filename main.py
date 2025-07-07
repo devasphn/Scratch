@@ -6,12 +6,8 @@ import sounddevice as sd
 import tempfile
 import os
 from datetime import datetime
-import threading
 import queue
 import time
-
-# Updated imports for proper threading context
-from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 class SpeechToTextAgent:
     def __init__(self):
@@ -19,7 +15,6 @@ class SpeechToTextAgent:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.sample_rate = 16000
         self.audio_queue = queue.Queue()
-        self.is_recording = False
         
     @st.cache_resource
     def load_model(_self):
@@ -53,20 +48,16 @@ class SpeechToTextAgent:
             return "Model not loaded"
         
         try:
-            # Create temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                # Save audio data
                 import soundfile as sf
                 sf.write(tmp_file.name, audio_data, self.sample_rate)
                 
-                # Transcribe
                 start_time = time.time()
                 result = self.model.transcribe(tmp_file.name, 
-                                             language="en",  # Change as needed
-                                             fp16=True)  # Use fp16 for faster inference
+                                             language="en",
+                                             fp16=True)
                 end_time = time.time()
                 
-                # Clean up
                 os.unlink(tmp_file.name)
                 
                 return {
@@ -76,25 +67,6 @@ class SpeechToTextAgent:
                 }
         except Exception as e:
             return f"Error transcribing: {e}"
-    
-    def real_time_transcribe(self, ctx):
-        """Real-time transcription with streaming - FIXED with proper context"""
-        # Add Streamlit context to this thread
-        add_script_run_ctx(ctx)
-        
-        chunk_duration = 3  # seconds
-        
-        try:
-            while self.is_recording:
-                audio_chunk = self.record_audio(chunk_duration)
-                if audio_chunk is not None:
-                    result = self.transcribe_audio(audio_chunk)
-                    if isinstance(result, dict):
-                        self.audio_queue.put(result)
-                time.sleep(0.1)
-        except Exception as e:
-            print(f"Error in real_time_transcribe: {e}")
-            self.is_recording = False
 
 def main():
     st.set_page_config(
@@ -109,6 +81,10 @@ def main():
     # Initialize agent
     if 'agent' not in st.session_state:
         st.session_state.agent = SpeechToTextAgent()
+    
+    # Initialize session state for streaming
+    if 'streaming_results' not in st.session_state:
+        st.session_state.streaming_results = []
     
     # GPU Status
     col1, col2, col3 = st.columns(3)
@@ -129,7 +105,7 @@ def main():
     st.markdown("---")
     
     # Mode selection
-    mode = st.radio("Select Mode:", ["Single Recording", "Real-time Streaming"])
+    mode = st.radio("Select Mode:", ["Single Recording", "Continuous Recording"])
     
     if mode == "Single Recording":
         col1, col2 = st.columns([1, 2])
@@ -176,64 +152,53 @@ def main():
                     gpu_memory_used = f"{torch.cuda.memory_allocated() / 1e9:.2f} GB"
                     st.metric("GPU Utilization", gpu_util)
                     st.metric("GPU Memory Used", gpu_memory_used)
-                except Exception as e:
+                except Exception:
                     st.metric("GPU Utilization", "Not available")
                     st.metric("GPU Memory Used", "Not available")
     
-    else:  # Real-time streaming
-        st.markdown("### 🔴 Real-time Streaming Mode")
+    else:  # Continuous Recording - NO THREADING
+        st.markdown("### 🔴 Continuous Recording Mode")
+        st.markdown("*Click 'Record Chunk' repeatedly for continuous transcription*")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            if not st.session_state.get('streaming', False):
-                if st.button("🔴 Start Streaming", type="primary"):
-                    st.session_state.streaming = True
-                    st.session_state.agent.is_recording = True
+            chunk_duration = st.slider("Chunk Duration (seconds)", 1, 10, 3)
+            
+            if st.button("🎤 Record Chunk", type="primary"):
+                with st.spinner(f"Recording {chunk_duration} seconds..."):
+                    audio_data = st.session_state.agent.record_audio(chunk_duration)
+                
+                if audio_data is not None:
+                    with st.spinner("Transcribing..."):
+                        result = st.session_state.agent.transcribe_audio(audio_data)
                     
-                    # FIXED: Get current context and pass it to thread
-                    ctx = get_script_run_ctx()
-                    
-                    # Start background thread with proper context
-                    thread = threading.Thread(
-                        target=st.session_state.agent.real_time_transcribe,
-                        args=(ctx,),
-                        daemon=True
-                    )
-                    thread.start()
-                    st.rerun()
-            else:
-                if st.button("⏹️ Stop Streaming", type="secondary"):
-                    st.session_state.streaming = False
-                    st.session_state.agent.is_recording = False
-                    st.rerun()
+                    if isinstance(result, dict):
+                        # Add to streaming results
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        result["timestamp"] = timestamp
+                        st.session_state.streaming_results.append(result)
+                        
+                        # Keep only last 10 results
+                        if len(st.session_state.streaming_results) > 10:
+                            st.session_state.streaming_results = st.session_state.streaming_results[-10:]
+                        
+                        st.success(f"✅ Chunk transcribed in {result['processing_time']:.2f}s")
+                        st.rerun()
+            
+            if st.button("🗑️ Clear Results"):
+                st.session_state.streaming_results = []
+                st.rerun()
         
-        # Display streaming results
-        if st.session_state.get('streaming', False):
-            st.markdown("**🎙️ Listening...**")
+        with col2:
+            st.markdown("### 📝 Transcription History")
             
-            # Create placeholder for results
-            results_container = st.container()
-            
-            # Process queue - FIXED: No direct st. calls from thread
-            transcription_results = []
-            while not st.session_state.agent.audio_queue.empty():
-                try:
-                    result = st.session_state.agent.audio_queue.get_nowait()
-                    transcription_results.append(result)
-                except queue.Empty:
-                    break
-            
-            # Display results in main thread
-            if transcription_results:
-                with results_container:
-                    for i, result in enumerate(transcription_results[-3:]):  # Show last 3 results
-                        st.text_area(f"Transcription {i+1}:", result["text"], height=100)
-                        st.caption(f"Processing time: {result['processing_time']:.2f}s")
-            
-            # Auto-refresh for streaming
-            time.sleep(1)
-            st.rerun()
+            if st.session_state.streaming_results:
+                for i, result in enumerate(reversed(st.session_state.streaming_results)):
+                    with st.expander(f"🎤 {result['timestamp']} - {result['processing_time']:.2f}s"):
+                        st.text_area("Text:", result["text"], height=100, key=f"result_{i}")
+            else:
+                st.info("No transcriptions yet. Click 'Record Chunk' to start.")
     
     # Footer
     st.markdown("---")
