@@ -1,64 +1,66 @@
 import streamlit as st
-import torch
 import whisper
-import numpy as np
-import sounddevice as sd
+import torch
 import tempfile
 import os
 from datetime import datetime
-import queue
-import time
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Install the audio recorder component
+# pip install streamlit-audiorec
+
+from st_audiorec import st_audiorec
 
 class SpeechToTextAgent:
     def __init__(self):
         self.model = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.sample_rate = 16000
-        self.audio_queue = queue.Queue()
         
     @st.cache_resource
     def load_model(_self):
         """Load Whisper model with caching"""
         try:
+            logger.info("Loading Whisper large-v3 model...")
             model = whisper.load_model("large-v3", device=_self.device)
+            logger.info("Model loaded successfully")
             return model
         except Exception as e:
+            logger.error(f"Error loading model: {e}")
             st.error(f"Error loading model: {e}")
             return None
     
-    def record_audio(self, duration=5):
-        """Record audio from microphone"""
-        try:
-            audio_data = sd.rec(int(duration * self.sample_rate), 
-                              samplerate=self.sample_rate, 
-                              channels=1, 
-                              dtype=np.float32)
-            sd.wait()
-            return audio_data.flatten()
-        except Exception as e:
-            st.error(f"Error recording audio: {e}")
-            return None
-    
-    def transcribe_audio(self, audio_data):
+    def transcribe_audio(self, audio_bytes):
         """Transcribe audio using Whisper"""
         if self.model is None:
+            logger.info("Loading model for transcription...")
             self.model = self.load_model()
         
         if self.model is None:
+            logger.error("Model not loaded")
             return "Model not loaded"
         
         try:
+            # Create temporary file for audio data
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                import soundfile as sf
-                sf.write(tmp_file.name, audio_data, self.sample_rate)
+                logger.info(f"Created temporary file: {tmp_file.name}")
+                tmp_file.write(audio_bytes)
+                tmp_file.flush()
                 
+                # Transcribe
+                logger.info("Starting transcription...")
                 start_time = time.time()
                 result = self.model.transcribe(tmp_file.name, 
                                              language="en",
                                              fp16=True)
                 end_time = time.time()
                 
+                # Clean up
                 os.unlink(tmp_file.name)
+                logger.info(f"Transcription completed in {end_time - start_time:.2f} seconds")
                 
                 return {
                     "text": result["text"],
@@ -66,6 +68,7 @@ class SpeechToTextAgent:
                     "language": result.get("language", "unknown")
                 }
         except Exception as e:
+            logger.error(f"Error transcribing audio: {e}")
             return f"Error transcribing: {e}"
 
 def main():
@@ -77,20 +80,23 @@ def main():
     
     st.title("🎤 Advanced Speech-to-Text Agent")
     st.markdown("**Powered by OpenAI Whisper Large-v3 on A40 GPU**")
+    st.markdown("**Browser-Based Microphone Recording**")
     
     # Initialize agent
     if 'agent' not in st.session_state:
         st.session_state.agent = SpeechToTextAgent()
+        logger.info("Initialized SpeechToTextAgent")
     
-    # Initialize session state for streaming
-    if 'streaming_results' not in st.session_state:
-        st.session_state.streaming_results = []
+    # Initialize transcription history
+    if 'transcription_history' not in st.session_state:
+        st.session_state.transcription_history = []
     
     # GPU Status
     col1, col2, col3 = st.columns(3)
     with col1:
         device = "🟢 GPU (CUDA)" if torch.cuda.is_available() else "🔴 CPU"
         st.metric("Device", device)
+        logger.info(f"Using device: {device}")
     
     with col2:
         if torch.cuda.is_available():
@@ -104,109 +110,130 @@ def main():
     # Main interface
     st.markdown("---")
     
-    # Mode selection
-    mode = st.radio("Select Mode:", ["Single Recording", "Continuous Recording"])
+    # Browser-based audio recording
+    st.markdown("### 🎤 Record Audio")
+    st.markdown("**Click the record button below to start recording from your microphone**")
     
-    if mode == "Single Recording":
-        col1, col2 = st.columns([1, 2])
+    # Audio recorder component
+    wav_audio_data = st_audiorec()
+    
+    if wav_audio_data is not None:
+        logger.info("Audio data received from browser")
+        st.success("✅ Audio recorded successfully!")
+        
+        # Display audio player
+        st.audio(wav_audio_data, format='audio/wav')
+        
+        # Transcription section
+        col1, col2 = st.columns([1, 1])
         
         with col1:
-            duration = st.slider("Recording Duration (seconds)", 1, 30, 5)
-            
-            if st.button("🎤 Start Recording", type="primary"):
-                with st.spinner("Recording..."):
-                    progress_bar = st.progress(0)
-                    for i in range(duration):
-                        time.sleep(1)
-                        progress_bar.progress((i + 1) / duration)
-                    
-                    audio_data = st.session_state.agent.record_audio(duration)
-                    
-                if audio_data is not None:
-                    with st.spinner("Transcribing..."):
-                        result = st.session_state.agent.transcribe_audio(audio_data)
-                    
-                    if isinstance(result, dict):
-                        st.success("✅ Transcription Complete!")
-                        st.info(f"**Processing Time:** {result['processing_time']:.2f} seconds")
-                        st.info(f"**Detected Language:** {result['language']}")
-                        
-                        # Display result
-                        st.text_area("Transcription:", result["text"], height=150)
-                        
-                        # Save option
-                        if st.button("💾 Save Transcription"):
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            filename = f"transcription_{timestamp}.txt"
-                            with open(filename, "w") as f:
-                                f.write(result["text"])
-                            st.success(f"Saved as {filename}")
-                    else:
-                        st.error(result)
-        
-        with col2:
-            st.markdown("### 📊 Performance Metrics")
-            if torch.cuda.is_available():
-                try:
-                    gpu_util = f"{torch.cuda.utilization():.1f}%"
-                    gpu_memory_used = f"{torch.cuda.memory_allocated() / 1e9:.2f} GB"
-                    st.metric("GPU Utilization", gpu_util)
-                    st.metric("GPU Memory Used", gpu_memory_used)
-                except Exception:
-                    st.metric("GPU Utilization", "Not available")
-                    st.metric("GPU Memory Used", "Not available")
-    
-    else:  # Continuous Recording - NO THREADING
-        st.markdown("### 🔴 Continuous Recording Mode")
-        st.markdown("*Click 'Record Chunk' repeatedly for continuous transcription*")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            chunk_duration = st.slider("Chunk Duration (seconds)", 1, 10, 3)
-            
-            if st.button("🎤 Record Chunk", type="primary"):
-                with st.spinner(f"Recording {chunk_duration} seconds..."):
-                    audio_data = st.session_state.agent.record_audio(chunk_duration)
+            if st.button("🔄 Transcribe Audio", type="primary"):
+                logger.info("Starting transcription process...")
+                with st.spinner("Transcribing audio..."):
+                    result = st.session_state.agent.transcribe_audio(wav_audio_data)
                 
-                if audio_data is not None:
-                    with st.spinner("Transcribing..."):
-                        result = st.session_state.agent.transcribe_audio(audio_data)
+                if isinstance(result, dict):
+                    st.success("✅ Transcription Complete!")
                     
-                    if isinstance(result, dict):
-                        # Add to streaming results
-                        timestamp = datetime.now().strftime("%H:%M:%S")
-                        result["timestamp"] = timestamp
-                        st.session_state.streaming_results.append(result)
-                        
-                        # Keep only last 10 results
-                        if len(st.session_state.streaming_results) > 10:
-                            st.session_state.streaming_results = st.session_state.streaming_results[-10:]
-                        
-                        st.success(f"✅ Chunk transcribed in {result['processing_time']:.2f}s")
-                        st.rerun()
-            
-            if st.button("🗑️ Clear Results"):
-                st.session_state.streaming_results = []
-                st.rerun()
+                    # Display results
+                    st.info(f"**Processing Time:** {result['processing_time']:.2f} seconds")
+                    st.info(f"**Detected Language:** {result['language']}")
+                    
+                    # Main transcription display
+                    st.text_area("Transcription:", result["text"], height=150, key="main_transcription")
+                    
+                    # Add to history
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    st.session_state.transcription_history.append({
+                        "timestamp": timestamp,
+                        "text": result["text"],
+                        "processing_time": result["processing_time"],
+                        "language": result["language"]
+                    })
+                    
+                    logger.info(f"Transcription added to history: {result['text'][:50]}...")
+                    
+                else:
+                    st.error(result)
+                    logger.error(f"Transcription failed: {result}")
         
         with col2:
-            st.markdown("### 📝 Transcription History")
-            
-            if st.session_state.streaming_results:
-                for i, result in enumerate(reversed(st.session_state.streaming_results)):
-                    with st.expander(f"🎤 {result['timestamp']} - {result['processing_time']:.2f}s"):
-                        st.text_area("Text:", result["text"], height=100, key=f"result_{i}")
-            else:
-                st.info("No transcriptions yet. Click 'Record Chunk' to start.")
+            if st.button("💾 Save Transcription"):
+                if isinstance(result, dict):
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"transcription_{timestamp}.txt"
+                    with open(filename, "w") as f:
+                        f.write(f"Timestamp: {timestamp}\n")
+                        f.write(f"Processing Time: {result['processing_time']:.2f}s\n")
+                        f.write(f"Language: {result['language']}\n")
+                        f.write(f"Text: {result['text']}\n")
+                    st.success(f"✅ Saved as {filename}")
+                    logger.info(f"Transcription saved to {filename}")
+                else:
+                    st.warning("No transcription to save")
     
-    # Footer
+    # Transcription History
+    if st.session_state.transcription_history:
+        st.markdown("---")
+        st.markdown("### 📝 Transcription History")
+        
+        for i, entry in enumerate(reversed(st.session_state.transcription_history[-5:])):
+            with st.expander(f"🎤 {entry['timestamp']} - {entry['processing_time']:.2f}s"):
+                st.text_area("Text:", entry["text"], height=100, key=f"history_{i}")
+                st.caption(f"Language: {entry['language']}")
+    
+    # Performance Metrics
     st.markdown("---")
-    st.markdown("**Tips for best results:**")
-    st.markdown("- Speak clearly and at moderate pace")
-    st.markdown("- Minimize background noise")
-    st.markdown("- Ensure good microphone quality")
-    st.markdown("- For technical terms, speak slowly")
+    st.markdown("### 📊 Performance Metrics")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if torch.cuda.is_available():
+            try:
+                gpu_util = f"{torch.cuda.utilization():.1f}%"
+                st.metric("GPU Utilization", gpu_util)
+            except Exception as e:
+                st.metric("GPU Utilization", "Not available")
+                logger.warning(f"GPU utilization not available: {e}")
+    
+    with col2:
+        if torch.cuda.is_available():
+            try:
+                gpu_memory_used = f"{torch.cuda.memory_allocated() / 1e9:.2f} GB"
+                st.metric("GPU Memory Used", gpu_memory_used)
+            except Exception as e:
+                st.metric("GPU Memory Used", "Not available")
+    
+    with col3:
+        st.metric("Total Transcriptions", len(st.session_state.transcription_history))
+    
+    # Clear history option
+    if st.session_state.transcription_history:
+        if st.button("🗑️ Clear History"):
+            st.session_state.transcription_history = []
+            st.success("History cleared!")
+            st.rerun()
+    
+    # Instructions
+    st.markdown("---")
+    st.markdown("### 💡 How to Use")
+    st.markdown("""
+    1. **Click the record button** 🔴 to start recording
+    2. **Speak clearly** into your microphone
+    3. **Click stop** ⏹️ when finished
+    4. **Click 'Transcribe Audio'** to convert speech to text
+    5. **View results** and save if needed
+    """)
+    
+    st.markdown("### 🔧 Troubleshooting")
+    st.markdown("""
+    - **No microphone prompt?** Make sure you're using **HTTPS** or add your domain to browser exceptions
+    - **Recording not working?** Check browser microphone permissions
+    - **Poor quality?** Speak clearly and minimize background noise
+    """)
 
 if __name__ == "__main__":
+    import time
     main()
