@@ -1,0 +1,15 @@
+cd workspace
+git clone https://github.com/devasphn/Scratch
+cd Scratch
+
+python -m venv venv
+source venv/bin/activate
+
+apt update && apt upgrade -y
+apt install -y ffmpeg
+
+pip install torch==2.1.0 torchaudio==2.1.0 openai-whisper==20231117 aiohttp==3.9.1 numpy==1.24.3 soundfile==0.12.1 silero-vad-lite==1.0.0 nvidia-ml-py
+
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+
+python main.py
