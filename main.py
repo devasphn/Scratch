@@ -10,6 +10,9 @@ import threading
 import queue
 import time
 
+# Updated imports for proper threading context
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+
 class SpeechToTextAgent:
     def __init__(self):
         self.model = None
@@ -74,17 +77,24 @@ class SpeechToTextAgent:
         except Exception as e:
             return f"Error transcribing: {e}"
     
-    def real_time_transcribe(self):
-        """Real-time transcription with streaming"""
+    def real_time_transcribe(self, ctx):
+        """Real-time transcription with streaming - FIXED with proper context"""
+        # Add Streamlit context to this thread
+        add_script_run_ctx(ctx)
+        
         chunk_duration = 3  # seconds
         
-        while self.is_recording:
-            audio_chunk = self.record_audio(chunk_duration)
-            if audio_chunk is not None:
-                result = self.transcribe_audio(audio_chunk)
-                if isinstance(result, dict):
-                    self.audio_queue.put(result)
-            time.sleep(0.1)
+        try:
+            while self.is_recording:
+                audio_chunk = self.record_audio(chunk_duration)
+                if audio_chunk is not None:
+                    result = self.transcribe_audio(audio_chunk)
+                    if isinstance(result, dict):
+                        self.audio_queue.put(result)
+                time.sleep(0.1)
+        except Exception as e:
+            print(f"Error in real_time_transcribe: {e}")
+            self.is_recording = False
 
 def main():
     st.set_page_config(
@@ -161,10 +171,14 @@ def main():
         with col2:
             st.markdown("### 📊 Performance Metrics")
             if torch.cuda.is_available():
-                gpu_util = f"{torch.cuda.utilization():.1f}%"
-                gpu_memory_used = f"{torch.cuda.memory_allocated() / 1e9:.2f} GB"
-                st.metric("GPU Utilization", gpu_util)
-                st.metric("GPU Memory Used", gpu_memory_used)
+                try:
+                    gpu_util = f"{torch.cuda.utilization():.1f}%"
+                    gpu_memory_used = f"{torch.cuda.memory_allocated() / 1e9:.2f} GB"
+                    st.metric("GPU Utilization", gpu_util)
+                    st.metric("GPU Memory Used", gpu_memory_used)
+                except Exception as e:
+                    st.metric("GPU Utilization", "Not available")
+                    st.metric("GPU Memory Used", "Not available")
     
     else:  # Real-time streaming
         st.markdown("### 🔴 Real-time Streaming Mode")
@@ -176,9 +190,16 @@ def main():
                 if st.button("🔴 Start Streaming", type="primary"):
                     st.session_state.streaming = True
                     st.session_state.agent.is_recording = True
-                    # Start background thread
-                    thread = threading.Thread(target=st.session_state.agent.real_time_transcribe)
-                    thread.daemon = True
+                    
+                    # FIXED: Get current context and pass it to thread
+                    ctx = get_script_run_ctx()
+                    
+                    # Start background thread with proper context
+                    thread = threading.Thread(
+                        target=st.session_state.agent.real_time_transcribe,
+                        args=(ctx,),
+                        daemon=True
+                    )
                     thread.start()
                     st.rerun()
             else:
@@ -194,15 +215,21 @@ def main():
             # Create placeholder for results
             results_container = st.container()
             
-            # Process queue
+            # Process queue - FIXED: No direct st. calls from thread
+            transcription_results = []
             while not st.session_state.agent.audio_queue.empty():
                 try:
                     result = st.session_state.agent.audio_queue.get_nowait()
-                    with results_container:
-                        st.text_area("Latest Transcription:", result["text"], height=100)
-                        st.caption(f"Processing time: {result['processing_time']:.2f}s")
+                    transcription_results.append(result)
                 except queue.Empty:
                     break
+            
+            # Display results in main thread
+            if transcription_results:
+                with results_container:
+                    for i, result in enumerate(transcription_results[-3:]):  # Show last 3 results
+                        st.text_area(f"Transcription {i+1}:", result["text"], height=100)
+                        st.caption(f"Processing time: {result['processing_time']:.2f}s")
             
             # Auto-refresh for streaming
             time.sleep(1)
